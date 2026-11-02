@@ -44,7 +44,7 @@ Collector chỉ phát ACK sau khi lưu MongoDB bền vững. Thiết bị chỉ 
 
 ## Dashboard và tiền xử lý
 
-Web có IR, RED, hai nhiệt độ, ngưỡng tùy chỉnh, lịch sử và xuất CSV. Nguồn **Minh họa** không phải dữ liệu thiết bị thật. Không có chẩn đoán hoặc thuật toán BPM/SpO2.
+Web có ba thẻ nhịp mạch, SpO₂ ước tính và trung vị nhiệt độ bề mặt, kèm nhận xét và mức đối chiếu tham khảo. Nguồn **Minh họa** không phải dữ liệu thiết bị thật. SpO₂ chưa hiệu chuẩn, nhiệt độ không phải thân nhiệt, không có chẩn đoán. Xem [ANALYSIS.md](ANALYSIS.md) để biết cổng chất lượng, công thức và ngưỡng. Phân tích chạy khi xem, không cần quyền ghi Atlas; raw, CSV và tab tiền xử lý riêng vẫn được giữ.
 
 ```powershell
 .\.venv\Scripts\python.exe preprocess.py --device esp32-01 --session SESSION_ID

@@ -1,6 +1,6 @@
 # Hướng dẫn cài đặt, nạp ESP32 và chạy web Signal Lab
 
-Cập nhật: 01/11/2026. Hướng dẫn cho Windows 10/11 64-bit, theo mã nguồn hiện tại trong repository.
+Cập nhật: 02/11/2026. Hướng dẫn cho Windows 10/11 64-bit, theo mã nguồn hiện tại trong repository.
 
 ## 1. Dự án hiện làm gì?
 
@@ -14,7 +14,7 @@ MAX30102 + GY-906 → ESP32 → MQTT cloud/TLS → collector Python → MongoDB 
 - IR/RED là giá trị ADC quang học, không phải BPM hoặc SpO₂. Cảm biến đang được cấu hình lấy trung bình FIFO phần cứng; “dữ liệu thô” ở đây là đầu ra cảm biến, chưa qua thuật toán xử lý PPG của backend.
 - Collector kiểm tra cấu trúc, phạm vi và thứ tự gói, loại trùng rồi lưu dữ liệu. Kiểm tra hợp lệ không phải tính nhịp tim hoặc chẩn đoán.
 - Web hiển thị dữ liệu thô, biểu đồ, ngưỡng do người dùng đặt và xuất CSV. Các ngưỡng không phải ngưỡng chẩn đoán được xác nhận.
-- Có script tiền xử lý chạy riêng, giữ nguyên dữ liệu gốc. Chưa có thuật toán BPM, SpO₂ hoặc chẩn đoán bệnh.
+- Web hiện tính nhịp mạch, SpO₂ ước tính thử nghiệm và trung vị nhiệt độ bề mặt theo [ANALYSIS.md](iot_lab/ANALYSIS.md). SpO₂ chưa hiệu chuẩn; không có chẩn đoán bệnh. Có script tiền xử lý chạy riêng, giữ nguyên dữ liệu gốc.
 - MQTT cloud và Atlas có thể truy cập qua Internet; **web vẫn chạy local** tại `http://127.0.0.1:8501`, chưa phải website công khai.
 
 ## 2. Chọn đúng vai trò trước khi cài

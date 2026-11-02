@@ -10,8 +10,11 @@ def packets():
         for j in range(50):
             t=(batch*50+j)/100;p=(t*1.16)%1
             wave=math.exp(-((p-.23)/.085)**2)+.22*math.exp(-((p-.5)/.12)**2)
-            ir.append(round(81000+1200*wave+120*math.sin(t)))
-            red.append(round(69000+850*wave+90*math.sin(t+.2)))
+            # Deterministic ADC-scale noise prevents an unrealistically exact flat
+            # diastolic plateau after integer quantization. Still explicitly synthetic.
+            noise=3*math.sin(2*math.pi*17.3*t)+2*math.cos(2*math.pi*23.1*t)
+            ir.append(round(81000+1200*wave+120*math.sin(t)+noise))
+            red.append(round(69000+850*wave+90*math.sin(t+.2)-.7*noise))
         result.append(validate({"device_id":"demo","session_id":"demo-15s","batch_index":batch+1,
              "batch_total":30,"sample_start_index":batch*50,"sample_rate_hz":100,
              "ir":ir,"red":red,"object_temp":round(34.1+.1*math.sin(batch/6),2),

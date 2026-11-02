@@ -14,7 +14,9 @@ ESP32 → MQTT Internet/TLS → Python collector → MongoDB Atlas → Streamlit
 - `iot_lab/`: collector, dashboard, tiền xử lý, công cụ cấu hình và kiểm thử.
 - `docs/`: tài liệu nghiên cứu cảm biến và tín hiệu.
 
-Mỗi phiên thu 1.500 cặp IR/RED ở đầu ra danh định 100 Hz và nhiệt độ khoảng mỗi giây. Chưa có thuật toán tính BPM/SpO2 hoặc chẩn đoán bệnh.
+Khảo sát thuật toán và nguồn ngưỡng: [BPM/SpO₂ từ IR/RED](docs/THUAT_TOAN_BPM_SPO2_VA_NGUONG_THAM_KHAO.md). Bản tính toán hiện tại và giới hạn: [phân tích nghiên cứu trên web](iot_lab/ANALYSIS.md).
+
+Mỗi phiên thu 1.500 cặp IR/RED ở đầu ra danh định 100 Hz và nhiệt độ khoảng mỗi giây. Web tính nhịp mạch, SpO₂ ước tính chưa hiệu chuẩn và trung vị nhiệt độ bề mặt; có cổng chất lượng và mức đối chiếu tham khảo. Chưa có chẩn đoán bệnh hoặc xác nhận độ chính xác y tế.
 
 ## Cài và chạy trên Windows
 

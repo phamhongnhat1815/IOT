@@ -10,9 +10,11 @@ ESP32 → MQTT Internet/TLS → Python collector → MongoDB Atlas → Streamlit
 
 **Bắt đầu tại [hướng dẫn đầy đủ từ cài đặt đến nạp code và xem web](HUONG_DAN_CAI_DAT_VA_NAP_CODE.md).** Có hướng dẫn riêng cho máy collector và người clone chỉ để xem dữ liệu.
 
-- `firmware/HealthRawDirect/`: firmware Arduino IDE, lưu offline vào LittleFS, nhận ACK rồi sleep.
+- `firmware/HealthRawDirect/`: firmware Arduino IDE, lưu offline vào LittleFS, nhận ACK rồi chờ online để nhận nhắc đo.
 - `iot_lab/`: collector, dashboard, tiền xử lý, công cụ cấu hình và kiểm thử.
 - `docs/`: tài liệu nghiên cứu cảm biến và tín hiệu.
+
+Web hiện có 4 tab: Tổng quan, Lịch đo, Thông báo, Dữ liệu. Lịch và cảnh báo chạy trong collector; nhắc đến giờ/bỏ lịch gửi MQTT về ESP32. Xem [hướng dẫn lịch và thông báo](docs/LICH_DO_VA_THONG_BAO.md) để biết cách chạy, quyền broker và giới hạn giờ đo offline.
 
 Khảo sát thuật toán và nguồn ngưỡng: [BPM/SpO₂ từ IR/RED](docs/THUAT_TOAN_BPM_SPO2_VA_NGUONG_THAM_KHAO.md). Bản tính toán hiện tại và giới hạn: [phân tích nghiên cứu trên web](iot_lab/ANALYSIS.md).
 

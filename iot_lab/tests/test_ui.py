@@ -19,11 +19,14 @@ def main():
     assert app.metric[2].label=="Nhiệt độ bề mặt"
     assert "bpm" in app.metric[0].value, app.metric[0].value
     assert "°C" in app.metric[2].value
-    assert [t.label for t in app.tabs]==["Phân tích","Dữ liệu thô","Tiền xử lý"]
-    assert any("MINH HỌA" in e.value for e in app.info)
-    assert any("Chưa có kết luận y khoa" in e.value for e in app.markdown)
+    assert [t.label for t in app.tabs]==["Tổng quan","Lịch đo","Thông báo","Dữ liệu"]
+    assert any("Dữ liệu minh họa" in e.value for e in app.markdown)
+    assert any("Chưa có kết luận y khoa" in e.value for e in app.caption)
+    assert any("Lịch đo tiếp theo" in e.value for e in app.markdown)
+    assert any("Thông báo cần chú ý" in e.value for e in app.markdown)
+    assert any(e.label == "Biểu đồ và chi tiết phiên đo" for e in app.expander)
     faulthandler.cancel_dump_traceback_later()
-    print("UI passed: 3 research metrics, 3 tabs, visible demo and clinical limits",flush=True)
+    print("UI passed: 3 research metrics, 4 tabs, visible demo and clinical limits",flush=True)
 
 
 if __name__=="__main__":main()

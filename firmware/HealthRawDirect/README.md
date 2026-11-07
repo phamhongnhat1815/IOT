@@ -1,6 +1,8 @@
 # Firmware ESP32 — HealthRawDirect
 
-ESP32 Dev Module/WROOM, MAX30102, GY-906/MLX90614 và còi chủ động. Gửi MQTT Internet qua TLS, xác nhận lưu MongoDB rồi sleep.
+ESP32 Dev Module/WROOM, MAX30102, GY-906/MLX90614 và còi chủ động. Gửi MQTT Internet qua TLS, xác nhận lưu MongoDB rồi chờ online để nhận nhắc đo.
+
+Bản mới thêm `control`/`control_ack`, còi nhắc đến giờ/bỏ lịch và đo lại sau khi nhấc/đặt tay. Xem [hướng dẫn đầy đủ](../../docs/LICH_DO_VA_THONG_BAO.md). Bản firmware mới chưa được biên dịch/kiểm chứng trên mạch trong lần chỉnh sửa này do CLI thiếu ESP32 core; số liệu build cuối tài liệu là của bản cũ.
 
 ## Đấu dây và thư viện
 
@@ -25,13 +27,13 @@ Code không tự format khi mount thất bại. Chỉ khi đây là lần đầu
 ## Luồng chạy
 
 1. Kiểm tra CRC/schema các file flash. File lỗi được giữ, báo lỗi và không đo mới.
-2. Không có phiên cũ: `NO PENDING`, đo ngay. Có phiên cũ: `REPLAY FIRST`, gửi tất cả trước; chỉ khi `REPLAY DONE` mới bắt đầu đo. Chưa gửi hết thì `REPLAY PENDING`, sleep và giữ file, kể cả flash còn chỗ.
+2. Không có phiên cũ: vào chờ online. Có phiên cũ: `REPLAY FIRST`, thử gửi trước. Chưa gửi hết thì giữ file và chờ online, thử lại mỗi 30s; không đo mới khi còn backlog.
 3. Đợi IR trên ngưỡng ổn định1s và đọc được nhiệt độ. Thu1500 cặp IR/RED ở đầu ra danh định100Hz (~15s), nhiệt độ khoảng1Hz, ít nhất5 lần hợp lệ. Không cần BPM hợp lệ.
 4. Nhấc tay, lỗi I2C/FIFO hoặc service gap>100ms: bỏ phiên RAM đang thu và bắt đầu lại. Không chạy Wi-Fi hoặc ghi flash trong lúc thu.
 5. Dừng MAX, ghi cả phiên vào file .tmp, flush/close và kiểm tra CRC/schema trước khi rename .ready.
 6. Mỗi phiên gửi30 gói ×50 cặp. Mỗi gói chờ đúng ACK topic/session/batch/sample_count/saved; chưa ACK thì gửi lại cùng nội dung sau2s. Ghi MongoDB bền vững mới ACK, publish() thành công chưa đủ.
 7. Chỉ xóa file sau30 ACK. Reset trước khi xóa có thể gửi lại; collector loại trùng theo device/session/batch.
-8. Gửi hết phiên mới: kêu dài2s, tắt còi, giữ GPIO ở mức tắt rồi deep sleep. Không timer wakeup; RESET/tắt bật nguồn để chạy lại.
+8. Gửi hết phiên mới: kêu dài2s rồi quay về chờ online. Nhấc tay rồi đặt lại để đo tiếp, không cần RESET. Trong lúc thu ngắt Wi-Fi; khi chờ kết nối MQTT để nhận nhắc. Lỗi nghiêm trọng vẫn báo còi và deep sleep.
 
 Mỗi lượt replay/upload tối đa300s; một gói chờ ACK tối đa30s rồi dừng sớm nếu không có tiến triển. Giữ tối đa8 phiên (~100KB dữ liệu phiên). Không ghi đè phiên chưa ACK. TLS kiểm tra CA/hostname; đồng bộ giờ NTP qua Internet trước khi kết nối, không dùng setInsecure.
 
@@ -41,8 +43,10 @@ Mỗi lượt replay/upload tối đa300s; một gói chờ ACK tối đa30s r�
 |---|---|
 | Gửi dữ liệu/chờ ACK | Kêu150ms mỗi1000ms |
 | Chờ ngón tay/thu mẫu | Kêu100ms → nghỉ100ms → kêu100ms → nghỉ1000ms, lặp lại |
-| Hoàn tất toàn bộ | Kêu dài2s rồi tắt và sleep |
-| Offline/còn phiên chưa gửi | Hai tiếng ngắn rồi tắt và sleep |
+| Hoàn tất toàn bộ | Kêu dài2s rồi chờ online |
+| Offline/còn phiên chưa gửi | Hai tiếng ngắn, giữ file và thử gửi lại |
+| Đến giờ đo | Một tiếng 200ms mỗi2s, trong10s |
+| Bỏ lịch đo | Hai tiếng ngắn mỗi2s, trong10s |
 | Lỗi | Ba tiếng ngắn rồi tắt và sleep |
 
 Task còi độc lập, không thêm delay chặn luồng thu mẫu.
@@ -53,6 +57,6 @@ Chỉ phiên đã ghi hoàn tất vào flash mới giữ qua mất nguồn. Tắ
 
 Bật MongoDB và collector Python trước khi gửi. Cần thấy `TRANSPORT: MQTT_CLOUD_TLS_V1`, `MQTT connected=1`, ACK1/30…30/30, rồi `Da xac nhan du 1500 cap; xoa file da gui.` Web chọn MongoDB → esp32-01.
 
-Kiểm tra các tình huống: có backlog + collector tắt phải sleep trước khi đo; có backlog + đủ ACK phải REPLAY DONE trước CAPTURE; không backlog phải NO PENDING và nhịp còi đo; nhấc tay giữa thu phải DO LAI. Không FORMAT để thử lỗi mạng.
+Kiểm tra các tình huống: có backlog + collector tắt phải giữ file và không đo đè; có backlog + đủ ACK phải gửi xong trước CAPTURE; không backlog phải ONLINE IDLE, nhận nhắc MQTT, đặt tay để đo; nhấc tay giữa thu phải DO LAI. Không FORMAT để thử lỗi mạng.
 
 Bản xử lý backlog/còi đã biên dịch: chương trình1106714 byte (84%), RAM tĩnh62492 byte (19%), Arduino-ESP32 3.3.12. Sau khi tách Wi-Fi ra header riêng, giá trị cấu hình và thuật toán giữ nguyên. Nhịp còi và các nhánh mới cần kiểm chứng trên mạch thật.

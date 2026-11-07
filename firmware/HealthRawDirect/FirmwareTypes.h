@@ -11,7 +11,7 @@ constexpr uint16_t MIN_TEMPERATURES = 5;
 constexpr uint32_t SESSION_MAGIC = 0x534C4142; // SLAB
 constexpr uint16_t SESSION_VERSION = 1;
 
-enum class SoundMode : uint8_t { QUIET, WAITING, SUCCESS, OFFLINE, ERROR, MEASURING };
+enum class SoundMode : uint8_t { QUIET, WAITING, SUCCESS, OFFLINE, ERROR, MEASURING, DUE, MISSED };
 
 #pragma pack(push, 1)
 struct Pair { uint32_t red; uint32_t ir; };

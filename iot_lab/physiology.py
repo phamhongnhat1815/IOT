@@ -105,7 +105,7 @@ def estimate_ppg(samples, info):
     if not len(maxima):
         return _invalid("Không tìm được chu kỳ mạch rõ trong khoảng 30–240 bpm.")
     best = float(np.max(acf[maxima]))
-    candidates = maxima[acf[maxima] >= max(.5, .9 * best)]
+    candidates = maxima[acf[maxima] >= max(.2, .9 * best)]
     if not len(candidates):
         return _invalid("Tính tuần hoàn yếu; chưa đủ chất lượng tính nhịp.")
     chosen = int(candidates[0])

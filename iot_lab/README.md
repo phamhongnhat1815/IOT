@@ -1,5 +1,7 @@
 # Signal Lab — Python backend và dashboard
 
+Giao diện mới: Tổng quan, Lịch đo, Thông báo, Dữ liệu. Collector kiểm tra lịch nền và gửi nhắc MQTT; xem [hướng dẫn lịch và thông báo](../docs/LICH_DO_VA_THONG_BAO.md). Khởi động lại collector để bật worker. Xem web vẫn có thể dùng tài khoản chỉ đọc; các thao tác lịch/thông báo cần quyền ghi collection mới.
+
 ESP32 → MQTT cloud/TLS → collector → MongoDB Community Server → Streamlit. Không cần Docker, ThingsBoard hay broker local.
 
 ## Cấu hình
@@ -40,11 +42,11 @@ TTL mặc định 7 ngày, xóa bất đồng bộ bởi MongoDB. Inbox là ngu�
 
 Topic dữ liệu `iot/<device_id>/raw`, ACK `iot/<device_id>/ack`. Hỗ trợ payload trực tiếp và các định dạng cũ `ppg_raw`/`raw_batch`. Mỗi phiên firmware có 30 gói × 50 cặp IR/RED, kèm tần số và metadata. Thời gian nhận UTC được lưu riêng với millis/micros của thiết bị; không suy tốc độ lấy mẫu từ thời điểm MQTT nhận gói.
 
-Collector chỉ phát ACK sau khi lưu MongoDB bền vững. Thiết bị chỉ xóa phiên flash sau đủ 30 ACK. Gửi lại cùng nội dung được loại trùng; cùng định danh nhưng khác nội dung bị từ chối. Xem [firmware](../firmware/HealthRawDirect/README.md) để biết cách xử lý offline và sleep.
+Collector chỉ phát ACK sau khi lưu MongoDB bền vững. Thiết bị chỉ xóa phiên flash sau đủ 30 ACK. Gửi lại cùng nội dung được loại trùng; cùng định danh nhưng khác nội dung bị từ chối. Xem [firmware](../firmware/HealthRawDirect/README.md) để biết cách xử lý offline và chờ online.
 
 ## Dashboard và tiền xử lý
 
-Web có ba thẻ nhịp mạch, SpO₂ ước tính và trung vị nhiệt độ bề mặt, kèm nhận xét và mức đối chiếu tham khảo. Nguồn **Minh họa** không phải dữ liệu thiết bị thật. SpO₂ chưa hiệu chuẩn, nhiệt độ không phải thân nhiệt, không có chẩn đoán. Xem [ANALYSIS.md](ANALYSIS.md) để biết cổng chất lượng, công thức và ngưỡng. Phân tích chạy khi xem, không cần quyền ghi Atlas; raw, CSV và tab tiền xử lý riêng vẫn được giữ.
+Web có ba chỉ số nhịp mạch, SpO₂ ước tính và trung vị nhiệt độ bề mặt. Nguồn **Minh họa** không phải dữ liệu thiết bị thật. SpO₂ chưa hiệu chuẩn, nhiệt độ không phải thân nhiệt, không có chẩn đoán. Xem [ANALYSIS.md](ANALYSIS.md) để biết cổng chất lượng và công thức. Xem chỉ số không cần quyền ghi Atlas; dữ liệu thô, CSV và tiền xử lý nằm trong tab Dữ liệu. Lịch đo/thông báo dùng các collection mới và cần quyền ghi khi chỉnh sửa.
 
 ```powershell
 .\.venv\Scripts\python.exe preprocess.py --device esp32-01 --session SESSION_ID

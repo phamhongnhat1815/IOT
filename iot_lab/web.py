@@ -10,7 +10,7 @@ from pymongo.errors import PyMongoError
 from storage import MongoStore
 from frames import frames
 from physiology import analyze
-from monitoring import Monitor, LOCAL, DAYS, local_time
+from monitoring import Monitor, LOCAL, DAYS, local_time, DEFAULT_LIMITS
 from overview_state import next_appointment, main_action
 import demo
 import config
@@ -63,13 +63,18 @@ def plot(df, key, color="#3974d5", height=220):
 with st.sidebar:
     st.markdown(f'<div class="sl-brand"><span class="sl-brand-mark">{icon("pulse", 25)}</span><div><strong>Signal Lab</strong><small>Hệ thống theo dõi chỉ số</small></div></div><div class="sl-eyebrow">NGUỒN & PHIÊN ĐO</div>', unsafe_allow_html=True)
     mode = st.radio("Nguồn dữ liệu", ["Minh họa", "MongoDB"])
-    hours = st.selectbox("Khoảng thời gian", [1, 6, 24, 168], index=2, format_func=lambda x: f"{x} giờ")
+    hours = st.selectbox("Khoảng thời gian", [1, 6, 24, 168], index=2, format_func=lambda x: f"{x} giờ", disabled=mode == "Minh họa")
+    if mode == "Minh họa":
+        st.caption("Không áp dụng cho phiên minh họa cố định.")
     device = session = None
     connection_error = None
     devices = []
     if mode == "MongoDB":
         try:
-            devices = database().devices()
+            if st.session_state.get("mongo_connection_failed"):
+                raise ValueError("Connection retry requested by user")
+            with st.spinner("Đang kết nối MongoDB…"):
+                devices = database().devices()
             if devices:
                 device = st.selectbox("Thiết bị", devices)
                 sessions = database().sessions(device, hours)
@@ -81,7 +86,11 @@ with st.sidebar:
             else:
                 st.caption("Chưa có thiết bị gửi dữ liệu.")
         except (PyMongoError, ValueError):
+            st.session_state["mongo_connection_failed"] = True
             connection_error = "Không kết nối được MongoDB. Kiểm tra cấu hình .env và kết nối mạng."
+        if connection_error and st.button("Thử kết nối lại"):
+            st.session_state.pop("mongo_connection_failed", None)
+            st.rerun()
     auto = st.toggle("Tự cập nhật", value=True)
     st.markdown('<div class="sl-sidebar-footer">ESP32 · MAX30102 · GY-906<br>Giờ Việt Nam · UTC+7</div>', unsafe_allow_html=True)
 
@@ -89,12 +98,15 @@ page_header("Dữ liệu minh họa" if mode == "Minh họa" else "Nguồn dữ 
             datetime.now(LOCAL).strftime("%d/%m/%Y"))
 if connection_error:
     st.error(connection_error)
+    st.caption("Đã dừng tự thử kết nối. Bấm Thử kết nối lại trong thanh bên khi cơ sở dữ liệu sẵn sàng.")
+
+refresh_enabled = auto and not connection_error
 
 overview, schedules_tab, notifications_tab, data_tab = st.tabs(["Tổng quan", "Lịch đo", "Thông báo", "Dữ liệu"])
 
 
 def read_session():
-    packets = demo.packets() if mode == "Minh họa" else database().packets(device, session) if session else []
+    packets = demo.packets() if mode == "Minh họa" else database().packets(device, session) if session and not connection_error else []
     samples, temps, info = frames(packets)
     result = analyze(samples, temps, info) if not samples.empty else None
     return packets, samples, temps, info, result
@@ -159,7 +171,7 @@ def overview_planning(context):
                 st.caption(f'{context["unread_count"]} thông báo chưa đọc · Xem đầy đủ trong tab Thông báo.')
 
 
-@st.fragment(run_every="2s" if auto else None)
+@st.fragment(run_every="2s" if refresh_enabled else None)
 def show_overview():
     try:
         packets, samples, temps, info, result = read_session()
@@ -174,7 +186,14 @@ def show_overview():
         tone = "neutral"
     st.markdown(f'<div class="sl-action {tone}"><span class="sl-action-mark">{icon("pulse", 20)}</span><div><strong>{escape(title)}</strong><p>{escape(description)}</p></div></div>', unsafe_allow_html=True)
     times = [p["ts"] for p in packets if isinstance(p.get("ts"), datetime)]
-    section("Kết quả đo", (device or "Thiết bị mô phỏng") + (" · Nhận lúc " + local_time(max(times)) if times else " · Chưa có phiên đo"))
+    section("Kết quả đo", (device or ("Thiết bị mô phỏng" if mode == "Minh họa" else "Chưa có thiết bị")) + (" · Nhận lúc " + local_time(max(times)) if times else " · Chưa có phiên đo"))
+    limits = DEFAULT_LIMITS if mode == "Minh họa" or connection_error else None
+    if limits is None:
+        try:
+            limits = get_monitor().limits()
+        except (PyMongoError, ValueError):
+            st.caption("Chưa tải được ngưỡng cảnh báo đã cấu hình.")
+            limits = {}
     with st.container(key="overview_results"):
         columns = st.columns(3)
         for col, channel, label, unit in [(columns[0], "bpm", "Nhịp mạch ước tính", "bpm"), (columns[1], "spo2", "SpO₂ ước tính", "%")]:
@@ -184,6 +203,17 @@ def show_overview():
                     symbol = "pulse" if channel == "bpm" else "oxygen"
                     st.markdown(f'<div class="sl-reading-top"><span class="sl-reading-icon {symbol}">{icon(symbol, 23)}</span><span class="sl-channel-label">{"NHỊP MẠCH" if channel == "bpm" else "OXY MÁU"}</span></div>', unsafe_allow_html=True)
                     st.metric(label, f"{result[channel]:.1f} {unit}" if valid else "—")
+                    rule = limits.get(channel, {})
+                    if valid and rule.get("enabled"):
+                        value = result[channel]
+                        if value < rule["low"] or value > rule["high"]:
+                            direction = "Thấp hơn" if value < rule["low"] else "Cao hơn"
+                            bound = rule["low"] if value < rule["low"] else rule["high"]
+                            st.warning(f"{direction} ngưỡng tham khảo {bound:g} {unit}.")
+                            if channel == "spo2":
+                                st.caption("SpO₂ chưa hiệu chuẩn; cần kiểm chứng bằng thiết bị đo đáng tin cậy.")
+                    if not valid and result:
+                        st.caption(" ".join(result["reasons"]))
                     st.markdown(f'<div class="sl-reading-footer">{"Ước tính từ phiên đo" if valid else "Chưa có kết quả"}</div>', unsafe_allow_html=True)
         temp = result["temperature"]["object"] if result else {"value": None, "count": 0, "stable": False}
         with columns[2]:
@@ -192,6 +222,10 @@ def show_overview():
                 st.metric("Nhiệt độ bề mặt", f"{temp['value']:.2f} °C" if temp["value"] is not None else "—")
                 note = "Chưa có kết quả" if temp["value"] is None else "Phép đo chưa ổn định" if not temp["stable"] else "Trung vị các lần đọc"
                 st.markdown(f'<div class="sl-reading-footer">{note}</div>', unsafe_allow_html=True)
+                rule = limits.get("object_temp", {})
+                if temp["stable"] and temp["value"] is not None and rule.get("enabled"):
+                    if temp["value"] < rule["low"] or temp["value"] > rule["high"]:
+                        st.warning(f"Ngoài ngưỡng nhiệt độ bề mặt {rule['low']:g}–{rule['high']:g} °C.")
     st.caption("SpO₂ chưa hiệu chuẩn. Nhiệt độ là nhiệt độ bề mặt. Chưa có kết luận y khoa.")
     overview_planning(context)
     if result is None:
@@ -227,6 +261,9 @@ def schedule_panel():
     section("Lịch đo", "Thiết lập giờ nhắc và các ngày đo lặp lại cho từng thiết bị.")
     if mode != "MongoDB":
         empty_state("Chưa kết nối lịch đo", "Chọn nguồn MongoDB trong thanh bên để tạo lịch và đồng bộ nhắc đo với ESP32.", "calendar")
+        return
+    if connection_error:
+        st.error("Không đọc hoặc lưu được lịch vào MongoDB.")
         return
     try:
         monitor = get_monitor()
@@ -272,11 +309,14 @@ MQTT_LABELS = {"pending": "Chờ gửi", "published": "Broker đã nhận; chờ
                "expired": "Hết hạn; chưa có xác nhận", "cancelled": "Đã hủy nhắc", "not_required": "Chỉ thông báo trên web"}
 KIND_LABELS = {"measurement_due": "Đến giờ đo", "measurement_missed": "Bỏ lịch đo", "threshold": "Vượt ngưỡng"}
 
-@st.fragment(run_every="5s" if auto else None)
+@st.fragment(run_every="5s" if refresh_enabled else None)
 def notifications_panel():
     section("Trung tâm thông báo", "Theo dõi nhắc đo, bỏ lịch và các chỉ số nằm ngoài ngưỡng cấu hình.")
     if mode != "MongoDB":
         empty_state("Chưa có thông báo từ thiết bị", "Chuyển sang MongoDB để xem lịch sử thông báo và xác nhận nhận lệnh từ ESP32.", "bell")
+        return
+    if connection_error:
+        st.error("Không đọc được thông báo từ MongoDB.")
         return
     try:
         monitor = get_monitor()
@@ -323,6 +363,9 @@ def alert_settings():
     with st.expander("Cấu hình cảnh báo vượt ngưỡng"):
         if mode != "MongoDB":
             st.caption("Chọn MongoDB để lưu cấu hình cảnh báo thật.")
+            return
+        if connection_error:
+            st.caption("Chưa có kết nối để đọc hoặc lưu ngưỡng cảnh báo.")
             return
         try:
             monitor = get_monitor()
@@ -381,7 +424,7 @@ def raw_plot_settings():
                 st.error("Kiểm tra giới hạn dưới/trên và quyền ghi file.")
 
 
-@st.fragment(run_every="2s" if auto else None)
+@st.fragment(run_every="2s" if refresh_enabled else None)
 def show_data():
     try:
         packets, samples, temps, info, result = read_session()
@@ -391,10 +434,10 @@ def show_data():
         section("Dữ liệu phiên đo", "Kiểm tra mẫu gốc và xuất dữ liệu để phân tích độc lập.")
         left, right = st.columns(2)
         with left:
-            st.caption("IR")
+            chart_heading("Tín hiệu IR", "Dữ liệu thô")
             plot(samples, "ir")
         with right:
-            st.caption("RED")
+            chart_heading("Tín hiệu RED", "Dữ liệu thô", "#647987")
             plot(samples, "red", "#647987")
         st.dataframe(samples, hide_index=True, height=250, width="stretch")
         downloads = st.columns(3)

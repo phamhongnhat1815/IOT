@@ -19,7 +19,6 @@
 #include <freertos/task.h>
 #include <atomic>
 #include <math.h>
-#include <Preferences.h>
 
 // ================= SUA THONG TIN CUA M =================
 
@@ -58,13 +57,6 @@ uint32_t lostEvents = 0;
 String rawTopic, ackTopic;
 uint16_t expectedAckBatch = 0;
 bool ackReceived = false, packetWasSent = false;
-String controlTopic, controlAckTopic;
-String controlEvents[16];
-uint8_t nextControlSlot = 0;
-Preferences reminderPrefs;
-bool reminderPrefsReady = false;
-bool waitForFingerRemoval = false;
-uint32_t idleContactSince = 0, lastIdleSample = 0, lastReplayTry = 0;
 TaskHandle_t buzzerHandle = nullptr;
 std::atomic<SoundMode> sound{SoundMode::QUIET};
 std::atomic<bool> soundFinished{true};
@@ -83,13 +75,6 @@ void buzzerTask(void*) {
     bool on = false, finished = false;
     switch (mode) {
       case SoundMode::QUIET: break;
-      case SoundMode::DUE:
-        on = elapsed % 2000UL < 200UL;
-        finished = elapsed >= 10000UL; break;
-      case SoundMode::MISSED:
-        on = elapsed % 2000UL < 150UL ||
-             (elapsed % 2000UL >= 300UL && elapsed % 2000UL < 450UL);
-        finished = elapsed >= 10000UL; break;
       case SoundMode::WAITING: on = elapsed % 1000UL < 150UL; break;
       case SoundMode::MEASURING: {
         // Two 100ms beeps, 100ms apart, then 1000ms silence. Non-blocking.
@@ -378,36 +363,6 @@ void acquireSession() {
 }
 
 void ackCallback(char* topic, byte* bytes, unsigned int length) {
-  if (controlTopic == topic) {
-    if (length > 512) return;
-    JsonDocument command;
-    if (deserializeJson(command, bytes, length)) return;
-    const char* target = command["device_id"] | "";
-    const char* eventId = command["event_id"] | "";
-    const char* event = command["event"] | "";
-    uint32_t expires = command["expires_at"] | 0UL;
-    if (strcmp(target, DEVICE_ID) != 0 || strlen(eventId) != 64 ||
-        time(nullptr) < 1700000000 || expires <= uint32_t(time(nullptr)) ||
-        (strcmp(event, "measurement_due") != 0 && strcmp(event, "measurement_missed") != 0)) return;
-    bool duplicate = false;
-    for (const String& saved : controlEvents) if (saved == eventId) duplicate = true;
-    if (!duplicate) {
-      controlEvents[nextControlSlot] = eventId;
-      if (reminderPrefsReady) {
-        char key[12]; snprintf(key, sizeof(key), "event%u", nextControlSlot);
-        reminderPrefs.putString(key, controlEvents[nextControlSlot]);
-      }
-      nextControlSlot = (nextControlSlot + 1) % 16;
-      if (reminderPrefsReady) reminderPrefs.putUChar("next", nextControlSlot);
-      soundFinished.store(false);
-      sound.store(strcmp(event, "measurement_due") == 0 ? SoundMode::DUE : SoundMode::MISSED);
-    }
-    JsonDocument ack;
-    ack["event_id"] = eventId; ack["device_id"] = DEVICE_ID; ack["received"] = true;
-    char payload[192]; serializeJson(ack, payload, sizeof(payload));
-    mqtt.publish(controlAckTopic.c_str(), payload, false);
-    return;
-  }
   if (ackTopic != topic || !packetWasSent || length > 512) return;
   JsonDocument ack;
   if (deserializeJson(ack, bytes, length)) return;
@@ -450,7 +405,7 @@ bool networkReady(uint32_t budgetStart, uint32_t budgetMs) {
       snprintf(clientId, sizeof(clientId), "slab-%08lx%08lx", (unsigned long)(ESP.getEfuseMac() >> 32), (unsigned long)ESP.getEfuseMac());
       bool connected = strlen(MQTT_USER) ? mqtt.connect(clientId, MQTT_USER, MQTT_PASSWORD) : mqtt.connect(clientId);
       if (connected) {
-        if (!mqtt.subscribe(ackTopic.c_str(), 1) || !mqtt.subscribe(controlTopic.c_str(), 1)) mqtt.disconnect();
+        if (!mqtt.subscribe(ackTopic.c_str(), 1)) mqtt.disconnect();
         Serial.printf("MQTT connected=%d\n", mqtt.connected());
       } else {
         Serial.printf("MQTT state=%d server=%s:%u WiFi=%d RSSI=%d\n",
@@ -559,18 +514,6 @@ void setup() {
   transport.setHandshakeTimeout(8);
   transport.setCACert(CLOUD_CA);
   mqtt.setServer(MQTT_SERVER, MQTT_PORT); mqtt.setCallback(ackCallback);
-  rawTopic = String("iot/") + DEVICE_ID + "/raw";
-  ackTopic = String("iot/") + DEVICE_ID + "/ack";
-  controlTopic = String("iot/") + DEVICE_ID + "/control";
-  controlAckTopic = String("iot/") + DEVICE_ID + "/control_ack";
-  reminderPrefsReady = reminderPrefs.begin("signal-reminder", false);
-  if (reminderPrefsReady) {
-    nextControlSlot = reminderPrefs.getUChar("next", 0) % 16;
-    for (uint8_t i = 0; i < 16; ++i) {
-      char key[12]; snprintf(key, sizeof(key), "event%u", i);
-      controlEvents[i] = reminderPrefs.getString(key, "");
-    }
-  }
   mqtt.setSocketTimeout(2); mqtt.setKeepAlive(30);
   if (!mqtt.setBufferSize(MQTT_BYTES + 128)) fatal("MQTT buffer");
   mountStorage(); recoverTemporaryFiles();
@@ -582,11 +525,10 @@ void setup() {
     sound.store(SoundMode::WAITING);
     bool replayed = flushPending(REPLAY_BUDGET_MS);
     if (!replayed || flashProblem) {
-      Serial.println("REPLAY PENDING: giu flash; thu lai khi cho online, KHONG do de du lieu.");
-      if (flashProblem) fatal("Flash loi; giu file de kiem tra");
-    } else {
-      Serial.println("REPLAY DONE: da gui het phien cu.");
+      Serial.println("REPLAY PENDING: KHONG do moi. Giu flash, sleep; RESET de thu lai.");
+      sleepWithSignal(flashProblem ? SoundMode::ERROR : SoundMode::OFFLINE);
     }
+    Serial.println("REPLAY DONE: da gui het phien cu. Bat dau do moi.");
   } else {
     Serial.println("NO PENDING: bat dau do ngay.");
   }
@@ -607,52 +549,18 @@ void setup() {
   if (!readRegister(0x08, fifo) || !readRegister(0x0A, spo2) || !readRegister(0x09, mode) ||
       (fifo & 0xE0) != 0x40 || (spo2 & 0x1F) != 0x0F || (mode & 0x07) != 0x03)
     fatal("Cau hinh MAX doc lai khong khop 100Hz RED+IR");
-  maxSensor.wakeUp(); maxSensor.clearFIFO();
-  Serial.println("ONLINE IDLE: cho nhac MQTT; dat ngon tay de do. Can cap nguon thuong xuyen.");
-}
-
-void loop() {
-  // Idle stays online. Acquisition still disables Wi-Fi to preserve the raw sampling contract.
-  networkReady(millis(), 1000UL);
-  if (millis() - lastIdleSample < 100UL) { delay(5); return; }
-  lastIdleSample = millis();
-  String pending[MAX_SAVED_SESSIONS];
-  if (millis() - lastReplayTry >= 30000UL) {
-    lastReplayTry = millis();
-    if (listPending(pending, MAX_SAVED_SESSIONS)) {
-      maxSensor.shutDown();
-      bool sent = flushPending(30000UL);
-      if (flashProblem) fatal("Flash loi; giu du lieu");
-      sound.store(sent ? SoundMode::SUCCESS : SoundMode::OFFLINE);
-      rawTopic = String("iot/") + DEVICE_ID + "/raw";
-      ackTopic = String("iot/") + DEVICE_ID + "/ack";
-      mqtt.disconnect();
-      maxSensor.wakeUp(); maxSensor.clearFIFO();
-      return;
-    }
-  }
-  // Networking can stall idle polling longer than the FIFO capacity. Drop idle-only
-  // samples before polling contact; acquisition has its own strict FIFO handling.
-  maxSensor.clearFIFO();
-  uint32_t ir = maxSensor.getIR();
-  if (ir <= FINGER_THRESHOLD) { waitForFingerRemoval = false; idleContactSince = 0; return; }
-  if (waitForFingerRemoval) return;
-  if (!idleContactSince) idleContactSince = millis();
-  if (millis() - idleContactSince < CONTACT_STABLE_MS) return;
-  if (listPending(pending, MAX_SAVED_SESSIONS)) return; // Never overwrite an unsent session.
-  if (LittleFS.totalBytes() - LittleFS.usedBytes() < sizeof(session) + 16384UL)
-    fatal("Flash gan day; khong ghi de");
-  mqtt.disconnect();
   acquireSession();
-  if (!commitSession()) fatal("Luu/kiem tra flash that bai; giu du lieu");
+  if (!commitSession()) fatal("Luu/kiem tra flash that bai; khong bao thanh cong");
+  Serial.println("FLASH SAVED. Co the gui lai sau RESET/mat nguon.");
   sound.store(SoundMode::WAITING);
   bool uploaded = flushPending(UPLOAD_BUDGET_MS);
-  if (flashProblem) fatal("Flash loi; giu du lieu");
-  sound.store(uploaded ? SoundMode::SUCCESS : SoundMode::OFFLINE);
-  waitForFingerRemoval = true; idleContactSince = 0;
-  lastReplayTry = millis();
-  rawTopic = String("iot/") + DEVICE_ID + "/raw";
-  ackTopic = String("iot/") + DEVICE_ID + "/ack";
-  mqtt.disconnect();
-  maxSensor.wakeUp(); maxSensor.clearFIFO();
+  if (uploaded && !flashProblem) {
+    Serial.println("SUCCESS: tat ca phien da du ACK.");
+    sleepWithSignal(SoundMode::SUCCESS);
+  } else {
+    Serial.println("OFFLINE/PENDING: du lieu van o flash; gui tiep o lan bat sau.");
+    sleepWithSignal(flashProblem ? SoundMode::ERROR : SoundMode::OFFLINE);
+  }
 }
+
+void loop() { delay(1000); } // setup ends in deep sleep

@@ -20,9 +20,10 @@
 #include <atomic>
 #include <math.h>
 #include <errno.h>
+#include <Preferences.h>
+#include "Reminder.h"
 
 SET_LOOP_TASK_STACK_SIZE(12288);
-#include <Preferences.h>
 
 // ================= SUA THONG TIN CUA M =================
 
@@ -71,14 +72,12 @@ uint32_t lastTemperatureMs = 0, lastDrainUs = 0, lastSampleMs = 0;
 uint32_t contactSince = 0, lastLog = 0, attempts = 0, latestIR = 0;
 uint32_t lostEvents = 0;
 String rawTopic, ackTopic;
-String controlTopic, controlAckTopic;
-String controlEvents[16];
-uint8_t nextControlSlot = 0;
+String reminderTopic, reminderAckTopic;
 Preferences reminderPrefs;
-bool reminderPrefsReady = false;
-std::atomic<bool> reminderMeasurementRequested{false};
-std::atomic<uint32_t> reminderUntil{0};
-std::atomic<bool> reminderMissed{false};
+Reminder::Cache reminderCache;
+bool reminderStorageReady = false;
+// One 32-bit atomic snapshot; no 64-bit atomic dependency on ESP32.
+std::atomic<uint32_t> reminderSound{0};
 std::atomic<uint16_t> expectedAckBatch{0};
 std::atomic<bool> ackReceived{false}, packetWasSent{false};
 std::atomic<SoundMode> sound{SoundMode::QUIET};
@@ -351,7 +350,59 @@ bool acquireSession() {
   return true;
 }
 
+void initReminders() {
+  reminderTopic = String("iot/") + DEVICE_ID + "/control";
+  reminderAckTopic = String("iot/") + DEVICE_ID + "/control_ack";
+  if (!reminderPrefs.begin("slab-reminder", false)) {
+    Serial.println("REMINDER: NVS unavailable; reminders disabled, measurement unchanged."); return;
+  }
+  uint8_t snapshot[Reminder::SNAPSHOT_BYTES];
+  if (!reminderPrefs.isKey("cache")) {
+    Reminder::encode(reminderCache,snapshot);
+    reminderStorageReady = reminderPrefs.putBytes("cache",snapshot,sizeof(snapshot)) == sizeof(snapshot);
+  } else if (reminderPrefs.getBytesLength("cache") == sizeof(snapshot) &&
+             reminderPrefs.getBytes("cache",snapshot,sizeof(snapshot)) == sizeof(snapshot)) {
+    reminderStorageReady = Reminder::decode(snapshot,sizeof(snapshot),reminderCache);
+  }
+  Serial.println(reminderStorageReady ? "REMINDER: ready (sound only, no automatic measurement)." :
+                 "REMINDER: NVS invalid; preserved, no reminder ACK/sound. Do not erase NVS.");
+}
+
+void receiveReminder(byte* bytes,unsigned int length) {
+  if (!reminderStorageReady || length>512) return;
+  JsonDocument d;
+  if (deserializeJson(d,bytes,length) || !d.is<JsonObject>()) return;
+  if (strcmp(d["device_id"] | "",DEVICE_ID) || !d["expires_at"].is<uint64_t>()) return;
+  const char* id=d["event_id"] | "", *kind=d["event"] | "";
+  bool missed=!strcmp(kind,"measurement_missed");
+  if (!Reminder::Cache::validId(id) || (!missed && strcmp(kind,"measurement_due"))) return;
+  int64_t now=time(nullptr);
+  uint64_t expires=d["expires_at"].as<uint64_t>();
+  if (now<1700000000LL || expires<=uint64_t(now) || expires>4102444800ULL) return;
+  if (!reminderCache.contains(id)) {
+    Reminder::Cache candidate=reminderCache;
+    if (!candidate.add(id,expires,uint64_t(now))) {
+      Serial.println("REMINDER: unexpired ID cache full; wait for retry."); return;
+    }
+    uint8_t snapshot[Reminder::SNAPSHOT_BYTES];
+    Reminder::encode(candidate,snapshot);
+    if (reminderPrefs.putBytes("cache",snapshot,sizeof(snapshot)) != sizeof(snapshot)) {
+      // A failed/uncertain write must not produce an application ACK or sound.
+      reminderStorageReady=false;
+      Serial.println("REMINDER: persistence failed; disabled until restart."); return;
+    }
+    reminderCache=candidate;
+    reminderSound.store(Reminder::soundWord(millis(),missed));
+    Serial.println(missed ? "REMINDER: missed measurement (sound only)." : "REMINDER: measurement due (sound only).");
+  }
+  JsonDocument ack;
+  ack["device_id"]=DEVICE_ID; ack["event_id"]=id; ack["received"]=true;
+  char payload[192]; serializeJson(ack,payload,sizeof(payload));
+  mqtt.publish(reminderAckTopic.c_str(),payload,false);
+}
+
 void ackCallback(char* topic, byte* bytes, unsigned int length) {
+  if (reminderTopic == topic) { receiveReminder(bytes,length); return; }
   String own=String("iot/")+DEVICE_ID;
   if (length<=768 && (String(topic)==own+"/event_ack" || String(topic)==own+"/command")) {
     JsonDocument d;
@@ -367,37 +418,6 @@ void ackCallback(char* topic, byte* bytes, unsigned int length) {
       AlertCommand cmd{}; snprintf(cmd.eventId,40,"%s",event); snprintf(cmd.commandId,40,"%s",id);
       if (xQueueSend(alertCommands,&cmd,0)!=pdTRUE) Serial.println("COMMAND queue full; web must retry.");
     }
-    return;
-  }
-  if (controlTopic == topic) {
-    if (length > 512) return;
-    JsonDocument command;
-    if (deserializeJson(command, bytes, length)) return;
-    const char* target = command["device_id"] | "";
-    const char* eventId = command["event_id"] | "";
-    const char* event = command["event"] | "";
-    uint32_t expires = command["expires_at"] | 0UL;
-    if (strcmp(target, DEVICE_ID) != 0 || strlen(eventId) != 64 ||
-        time(nullptr) < 1700000000 || expires <= uint32_t(time(nullptr)) ||
-        (strcmp(event, "measurement_due") != 0 && strcmp(event, "measurement_missed") != 0)) return;
-    bool duplicate = false;
-    for (const String& saved : controlEvents) if (saved == eventId) duplicate = true;
-    if (!duplicate) {
-      controlEvents[nextControlSlot] = eventId;
-      if (reminderPrefsReady) {
-        char key[12]; snprintf(key, sizeof(key), "event%u", nextControlSlot);
-        reminderPrefs.putString(key, controlEvents[nextControlSlot]);
-      }
-      nextControlSlot = (nextControlSlot + 1) % 16;
-      if (reminderPrefsReady) reminderPrefs.putUChar("next", nextControlSlot);
-      reminderMissed.store(strcmp(event, "measurement_missed") == 0);
-      reminderUntil.store(millis() + 10000UL);
-      if (!reminderMissed.load()) reminderMeasurementRequested.store(true);
-    }
-    JsonDocument ack;
-    ack["event_id"] = eventId; ack["device_id"] = DEVICE_ID; ack["received"] = true;
-    char payload[192]; serializeJson(ack, payload, sizeof(payload));
-    mqtt.publish(controlAckTopic.c_str(), payload, false);
     return;
   }
   if (ackTopic != topic || !packetWasSent || length > 512) return;
@@ -468,7 +488,7 @@ bool networkReady(uint32_t budgetStart, uint32_t budgetMs) {
         String own=String("iot/")+DEVICE_ID;
         ok=mqtt.subscribe((own+"/event_ack").c_str(),1) && ok;
         ok=mqtt.subscribe((own+"/command").c_str(),1) && ok;
-        ok=mqtt.subscribe(controlTopic.c_str(),1) && ok;
+        ok=mqtt.subscribe(reminderTopic.c_str(),1) && ok;
         if (!ok) mqtt.disconnect();
         Serial.printf("MQTT connected=%d\n", mqtt.connected());
       } else {
@@ -636,18 +656,7 @@ void setup() {
       !strstr(CLOUD_CA,"-----BEGIN CERTIFICATE-----") || !identifierValid(DEVICE_ID,32))
     fatal("Cau hinh MqttCloud.h/DEVICE_ID; SOS va MPU van chay.");
   transport.setConnectionTimeout(5000); transport.setHandshakeTimeout(8); transport.setCACert(CLOUD_CA);
-  rawTopic = String("iot/") + DEVICE_ID + "/raw";
-  ackTopic = String("iot/") + DEVICE_ID + "/ack";
-  controlTopic = String("iot/") + DEVICE_ID + "/control";
-  controlAckTopic = String("iot/") + DEVICE_ID + "/control_ack";
-  reminderPrefsReady = reminderPrefs.begin("signal-reminder", false);
-  if (reminderPrefsReady) {
-    nextControlSlot = reminderPrefs.getUChar("next", 0) % 16;
-    for (uint8_t i = 0; i < 16; ++i) {
-      char key[12]; snprintf(key, sizeof(key), "event%u", i);
-      controlEvents[i] = reminderPrefs.getString(key, "");
-    }
-  }
+  initReminders();
   mqtt.setServer(MQTT_SERVER,MQTT_PORT); mqtt.setCallback(ackCallback);
   mqtt.setSocketTimeout(MQTT_RESPONSE_TIMEOUT_S); mqtt.setKeepAlive(30);
   if (!mqtt.setBufferSize(MQTT_BYTES+128)) fatal("MQTT buffer");
@@ -689,7 +698,6 @@ void reportMeasurementWait() {
 }
 
 void loop() {
-  if (reminderMeasurementRequested.exchange(false)) measurementRequested = true;
   serialWearable();
   reportMeasurementWait();
   if (flashProblem || wearableFault.load()) { sound.store(SoundMode::QUIET); delay(10); return; }

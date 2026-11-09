@@ -1,5 +1,7 @@
 # Signal Lab
 
+**Firmware wearable mới:** theo dõi MPU6050/SOS liên tục, LED đo/gửi, cảnh báo MQTT và tắt từ web. Xem [đấu dây, hành vi, ngưỡng thử nghiệm và kiểm tra](firmware/HealthRawDirect/README.md). Các mô tả deep sleep bên dưới thuộc phiên bản cũ.
+
 Thu thập dữ liệu thô từ ESP32 + MAX30102 + GY-906, lưu MongoDB và hiển thị biểu đồ bằng Streamlit.
 
 ```text

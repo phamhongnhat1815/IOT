@@ -7,6 +7,7 @@ import json
 import paho.mqtt.client as mqtt
 from pymongo.errors import PyMongoError
 import config
+from alerts import validate_event, save_event, dispatch_commands
 from model import validate
 from storage import MongoStore, ConflictError
 
@@ -39,12 +40,19 @@ def main():
 
     def connected(c,u,flags,reason,props):
         if reason.is_failure: log.warning("MQTT connection refused: %s",reason);return
-        c.subscribe(config.MQTT_TOPIC,qos=1)
+        c.subscribe([(config.MQTT_TOPIC,1),("iot/+/event",1)])
         log.info("MQTT subscribed to %s",config.MQTT_TOPIC)
 
     def received(c,u,msg):
         start=time.perf_counter()
         try:
+            if msg.topic.endswith("/event"):
+                data=validate_event(msg.payload,msg.topic)
+                ack=save_event(store.db,data)
+                c.publish(f'iot/{data["device_id"]}/event_ack',json.dumps(ack),qos=1,retain=False)
+                if msg.qos:c.ack(msg.mid,msg.qos)
+                log.info("ALERT device=%s kind=%s state=%s event=%s revision=%s",data["device_id"],data["kind"],data["state"],data["event_id"],data["revision"])
+                return
             record=validate(msg.payload,msg.topic)
             db_start=time.perf_counter()
             fresh=store.save_raw(record)
@@ -72,6 +80,12 @@ def main():
                  raw_write_ms,(time.perf_counter()-start)*1000,record["e2e_ms"])
 
     client.on_connect=connected;client.on_message=received
+    def command_worker():
+        while not stop.wait(2):
+            if client.is_connected():
+                try: dispatch_commands(store.db,client)
+                except (PyMongoError, OSError): log.warning("Command delivery unavailable; waiting for retry")
+    threading.Thread(target=command_worker,name="alarm-commands",daemon=True).start()
     def finish(*_):stop.set();client.disconnect()
     signal.signal(signal.SIGINT,finish);signal.signal(signal.SIGTERM,finish)
     # Explicit outer reconnect also handles deliberate disconnect on failed DB writes.

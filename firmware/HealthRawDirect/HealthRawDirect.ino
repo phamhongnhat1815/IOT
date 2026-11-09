@@ -19,6 +19,9 @@
 #include <freertos/task.h>
 #include <atomic>
 #include <math.h>
+#include <errno.h>
+
+SET_LOOP_TASK_STACK_SIZE(12288);
 
 // ================= SUA THONG TIN CUA M =================
 
@@ -36,16 +39,28 @@ constexpr uint8_t SDA_PIN = 21, SCL_PIN = 22, MAX_ADDRESS = 0x57;
 constexpr uint8_t MAX_SAVED_SESSIONS = 8;
 constexpr uint32_t CONTACT_STABLE_MS = 1000;
 constexpr uint32_t ACK_RETRY_MS = 2000;
+constexpr uint16_t MQTT_RESPONSE_TIMEOUT_S=15;
+constexpr uint32_t MQTT_RECONNECT_MS=10000;
 // A full cloud backlog needs more than 20s; do not starve at batch 25 on every boot.
 constexpr uint32_t REPLAY_BUDGET_MS = 300000;
 constexpr uint32_t UPLOAD_BUDGET_MS = 300000;
-constexpr uint32_t ACK_WAIT_MS = 30000; // Stop early when one batch makes no progress.
+constexpr uint32_t ACK_WAIT_MS = 120000; // Stop early when one batch makes no progress.
 constexpr uint32_t MAX_DRAIN_GAP_US = 100000;
 constexpr size_t MQTT_BYTES = 2304;
 
 MAX30105 maxSensor;
 Adafruit_MLX90614 mlx;
-WiFiClientSecure transport;
+// PubSubClient waits synchronously for CONNACK/packet bytes. Yield while empty so
+// a slow broker cannot spin a CPU core and starve its idle task/watchdog.
+class CooperativeSecureClient : public WiFiClientSecure {
+ public:
+  int available() override {
+    int bytes=WiFiClientSecure::available();
+    if (bytes<=0) delay(1);
+    return bytes;
+  }
+};
+CooperativeSecureClient transport;
 PubSubClient mqtt(transport);
 RawSession session{};
 bool maxReady = false, filesystemReady = false, capturing = false;
@@ -55,70 +70,21 @@ uint32_t lastTemperatureMs = 0, lastDrainUs = 0, lastSampleMs = 0;
 uint32_t contactSince = 0, lastLog = 0, attempts = 0, latestIR = 0;
 uint32_t lostEvents = 0;
 String rawTopic, ackTopic;
-uint16_t expectedAckBatch = 0;
-bool ackReceived = false, packetWasSent = false;
-TaskHandle_t buzzerHandle = nullptr;
+std::atomic<uint16_t> expectedAckBatch{0};
+std::atomic<bool> ackReceived{false}, packetWasSent{false};
 std::atomic<SoundMode> sound{SoundMode::QUIET};
-std::atomic<bool> soundFinished{true};
-
 void buzzerWrite(bool on) {
   digitalWrite(BUZZER_PIN, on ? BUZZER_ON_LEVEL : !BUZZER_ON_LEVEL);
 }
-
-void buzzerTask(void*) {
-  SoundMode previous = SoundMode::QUIET;
-  uint32_t started = millis();
-  for (;;) {
-    SoundMode mode = sound.load();
-    if (mode != previous) { previous = mode; started = millis(); }
-    uint32_t elapsed = millis() - started;
-    bool on = false, finished = false;
-    switch (mode) {
-      case SoundMode::QUIET: break;
-      case SoundMode::WAITING: on = elapsed % 1000UL < 150UL; break;
-      case SoundMode::MEASURING: {
-        // Two 100ms beeps, 100ms apart, then 1000ms silence. Non-blocking.
-        uint32_t phase = elapsed % 1300UL;
-        on = phase < 100UL || (phase >= 200UL && phase < 300UL);
-        break;
-      }
-      case SoundMode::SUCCESS: on = elapsed < 2000UL; finished = elapsed >= 2000UL; break;
-      case SoundMode::OFFLINE:
-        on = elapsed < 120UL || (elapsed >= 270UL && elapsed < 390UL);
-        finished = elapsed >= 650UL; break;
-      case SoundMode::ERROR:
-        on = elapsed < 150UL || (elapsed >= 300UL && elapsed < 450UL) ||
-             (elapsed >= 600UL && elapsed < 750UL);
-        finished = elapsed >= 1000UL; break;
-    }
-    buzzerWrite(on);
-    if (finished) { sound.store(SoundMode::QUIET); soundFinished.store(true); }
-    vTaskDelay(pdMS_TO_TICKS(10));
-  }
-}
-
-void sleepWithSignal(SoundMode mode) {
-  if (maxReady) maxSensor.shutDown();
-  mqtt.disconnect();
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
-  soundFinished.store(false);
-  sound.store(mode);
-  while (!soundFinished.load()) delay(10);
-  if (buzzerHandle) { vTaskDelete(buzzerHandle); buzzerHandle = nullptr; }
-  buzzerWrite(false);
-  if (filesystemReady) LittleFS.end();
-  Serial.println("SLEEP. Bam RESET hoac tat/bat nguon de chay lai.");
-  Serial.flush();
-  gpio_hold_en(static_cast<gpio_num_t>(BUZZER_PIN));
-  gpio_deep_sleep_hold_en();
-  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
-  esp_deep_sleep_start();
-}
-
+std::atomic<bool> eventSending{false};
+#include "Wearable.h"
+SemaphoreHandle_t mqttMutex=nullptr;
+TaskHandle_t networkHandle=nullptr;
 void fatal(const char* reason) {
   Serial.print("ERROR: "); Serial.println(reason);
-  sleepWithSignal(SoundMode::ERROR);
+  sound.store(SoundMode::QUIET);
+  // Preserve SOS/fall task even when measurement or storage needs attention.
+  while (true) { serialWearable(); delay(10); }
 }
 
 bool identifierValid(const char* value, size_t capacity) {
@@ -328,41 +294,72 @@ void drainFifo() {
   }
 }
 
-void acquireSession() {
-  WiFi.mode(WIFI_OFF); // No networking or flash writes during ADC acquisition.
+bool acquireSession() {
+  captureInterrupted=false;
   sound.store(SoundMode::MEASURING);
   capturing = false; contactSince = 0;
   session.pairCount = session.temperatureCount = 0;
+  xSemaphoreTake(sensorMutex,portMAX_DELAY);
   readSurfaceTemperature();
   maxSensor.clearFIFO(); maxSensor.wakeUp();
+  xSemaphoreGive(sensorMutex);
   lastDrainUs = micros(); lastSampleMs = millis();
   Serial.println("Dat ngon tay va giu yen ~16 giay. Khong can B=1.");
   while (session.pairCount < SESSION_PAIRS) {
+    serialWearable();
+    if (captureInterrupted.load() || emergency.load() || !mpuHealthy.load() || millis()-mpuLastSample.load()>100) {
+      xSemaphoreTake(sensorMutex,portMAX_DELAY); maxSensor.shutDown(); xSemaphoreGive(sensorMutex);
+      capturing=false; sound.store(SoundMode::QUIET);
+      Serial.println("CAPTURE ABORT: uu tien SOS/nga/loi MPU; khong luu phien do dang."); return false;
+    }
+    xSemaphoreTake(sensorMutex,portMAX_DELAY);
     drainFifo();
+    xSemaphoreGive(sensorMutex);
     if (session.pairCount >= SESSION_PAIRS) break;
     if (millis() - lastTemperatureMs >= 1000UL) {
+      xSemaphoreTake(sensorMutex,portMAX_DELAY);
       bool valid = readSurfaceTemperature();
       if (!valid) resetCapture("nhiet do khong hop le");
       else if (capturing && session.temperatureCount < MAX_TEMPERATURES &&
                session.pairCount > session.temperatures[session.temperatureCount - 1].sampleIndex)
         session.temperatures[session.temperatureCount++] = {session.pairCount, lastTemperatureMs, objectTemp, ambientTemp};
       drainFifo();
+      xSemaphoreGive(sensorMutex);
     }
     if (millis() - lastSampleMs > 3000UL) fatal("MAX30102 khong tra mau; kiem tra day/nguon");
     if (millis() - lastLog >= 1000UL) {
       lastLog = millis();
-      Serial.printf("IR=%lu F=%d T=%d samples=%u/1500 lost_events=%lu\n",
+      Serial.printf("IR=%lu F=%d T=%d objectC=%.2f ambientC=%.2f samples=%u/1500 lost_events=%lu\n",
                     (unsigned long)latestIR, latestIR > FINGER_THRESHOLD,
-                    isfinite(objectTemp) && isfinite(ambientTemp), session.pairCount, (unsigned long)lostEvents);
+                    isfinite(objectTemp) && isfinite(ambientTemp),objectTemp,ambientTemp,
+                    session.pairCount, (unsigned long)lostEvents);
     }
     delay(1);
   }
-  maxSensor.shutDown(); capturing = false;
+  xSemaphoreTake(sensorMutex,portMAX_DELAY); maxSensor.shutDown(); xSemaphoreGive(sensorMutex); capturing = false;
   sound.store(SoundMode::QUIET);
   Serial.printf("CAPTURE DONE: %u cap, %u lan nhiet do. Dang luu flash...\n", session.pairCount, session.temperatureCount);
+  return true;
 }
 
 void ackCallback(char* topic, byte* bytes, unsigned int length) {
+  String own=String("iot/")+DEVICE_ID;
+  if (length<=768 && (String(topic)==own+"/event_ack" || String(topic)==own+"/command")) {
+    JsonDocument d;
+    if (deserializeJson(d,bytes,length) || strcmp(d["device_id"] | "",DEVICE_ID)) return;
+    if (String(topic)==own+"/event_ack") {
+      if (d["saved"].is<bool>() && d["saved"].as<bool>() && d["revision"].is<uint32_t>())
+        alertAck(d["event_id"] | "",d["revision"].as<uint32_t>());
+    } else {
+      if (strcmp(d["action"] | "","clear_alarm") || !d["expires_at"].is<int64_t>() ||
+          time(nullptr)<1700000000 || d["expires_at"].as<int64_t>()<time(nullptr)) return;
+      const char* event=d["event_id"] | "", *id=d["command_id"] | "";
+      if (!identifierValid(event,40) || !identifierValid(id,40)) return;
+      AlertCommand cmd{}; snprintf(cmd.eventId,40,"%s",event); snprintf(cmd.commandId,40,"%s",id);
+      if (xQueueSend(alertCommands,&cmd,0)!=pdTRUE) Serial.println("COMMAND queue full; web must retry.");
+    }
+    return;
+  }
   if (ackTopic != topic || !packetWasSent || length > 512) return;
   JsonDocument ack;
   if (deserializeJson(ack, bytes, length)) return;
@@ -377,35 +374,61 @@ void ackCallback(char* topic, byte* bytes, unsigned int length) {
 }
 
 bool networkReady(uint32_t budgetStart, uint32_t budgetMs) {
-  static uint32_t lastWifiTry = 0, lastMqttTry = 0;
-  static bool wifiTried = false, mqttTried = false;
-  static bool ntpRequested = false;
+  static uint32_t lastWifiTry = 0, lastMqttTry = 0, lastStatus = 0;
+  static uint32_t lastNtpTry = 0;
+  static bool wifiTried = false, mqttTried = false, ntpRequested = false;
+  static bool wifiWasConnected = false;
   if (millis() - budgetStart >= budgetMs) return false;
   if (WiFi.status() != WL_CONNECTED) {
-    if (!wifiTried || millis() - lastWifiTry >= 7000UL) {
+    wifiWasConnected = false;
+    ntpRequested = false;
+    // Give an association attempt time to finish before explicitly restarting it.
+    if (!wifiTried || millis() - lastWifiTry >= 30000UL) {
+      if (wifiTried) WiFi.disconnect(false, false);
       wifiTried = true; lastWifiTry = millis();
       WiFi.mode(WIFI_STA); WiFi.setAutoReconnect(true);
       WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      Serial.println("WIFI: bat dau ket noi (mang 2.4 GHz, khong captive portal).");
+    }
+    if (millis() - lastStatus >= 5000UL) {
+      lastStatus = millis();
+      Serial.printf("WIFI WAIT: status=%d; kiem tra SSID/password/song Wi-Fi.\n", int(WiFi.status()));
     }
     return false;
   }
+  if (!wifiWasConnected) {
+    wifiWasConnected = true;
+    Serial.print("WIFI OK: IP="); Serial.print(WiFi.localIP());
+    Serial.printf(" RSSI=%d\n", WiFi.RSSI());
+  }
   // Certificate verification needs a valid clock. Never bypass TLS verification.
   if (time(nullptr) < 1700000000) {
-    if (!ntpRequested) {
-      ntpRequested = true;
-      configTime(0, 0, "pool.ntp.org", "time.google.com");
+    if (!ntpRequested || millis() - lastNtpTry >= 30000UL) {
+      ntpRequested = true; lastNtpTry = millis();
+      configTime(0, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
       Serial.println("TLS: dang dong bo gio NTP...");
+    }
+    if (millis() - lastStatus >= 5000UL) {
+      lastStatus = millis();
+      Serial.println("NTP WAIT: chua co gio; kiem tra Internet/UDP 123, thu hotspot dien thoai.");
     }
     return false;
   }
   if (!mqtt.connected()) {
-    if (!mqttTried || millis() - lastMqttTry >= 3000UL) {
+    if (!mqttTried || millis() - lastMqttTry >= MQTT_RECONNECT_MS) {
       mqttTried = true; lastMqttTry = millis();
       char clientId[40];
       snprintf(clientId, sizeof(clientId), "slab-%08lx%08lx", (unsigned long)(ESP.getEfuseMac() >> 32), (unsigned long)ESP.getEfuseMac());
+      uint32_t connectStarted=millis();
+      Serial.printf("MQTT CONNECT: cho CONNACK toi da %us (SOS/MPU van chay).\n",MQTT_RESPONSE_TIMEOUT_S);
       bool connected = strlen(MQTT_USER) ? mqtt.connect(clientId, MQTT_USER, MQTT_PASSWORD) : mqtt.connect(clientId);
       if (connected) {
-        if (!mqtt.subscribe(ackTopic.c_str(), 1)) mqtt.disconnect();
+        bool ok=true;
+        if (ackTopic.length()) ok=mqtt.subscribe(ackTopic.c_str(),1);
+        String own=String("iot/")+DEVICE_ID;
+        ok=mqtt.subscribe((own+"/event_ack").c_str(),1) && ok;
+        ok=mqtt.subscribe((own+"/command").c_str(),1) && ok;
+        if (!ok) mqtt.disconnect();
         Serial.printf("MQTT connected=%d\n", mqtt.connected());
       } else {
         Serial.printf("MQTT state=%d server=%s:%u WiFi=%d RSSI=%d\n",
@@ -413,7 +436,34 @@ bool networkReady(uint32_t budgetStart, uint32_t budgetMs) {
         Serial.print("ESP_IP="); Serial.print(WiFi.localIP());
         Serial.print(" MASK="); Serial.print(WiFi.subnetMask());
         Serial.print(" GATEWAY="); Serial.println(WiFi.gatewayIP());
+        char tlsError[192]{};
+        int tlsCode=transport.lastError(tlsError,sizeof(tlsError));
+        if (tlsCode<0) Serial.printf("TLS ERROR: code=%d detail=%s\n",tlsCode,tlsError);
+        else Serial.printf("TLS STATUS: result=%d (khong phai ma loi TLS).\n",tlsCode);
+        if (mqtt.state()==-4)
+          Serial.printf("MQTT CONNACK TIMEOUT: responseTimeout=%us totalAttemptMs=%lu; broker chua tra loi CONNECT.\n",
+                        MQTT_RESPONSE_TIMEOUT_S,(unsigned long)(millis()-connectStarted));
+        static uint32_t lastProbe=0;
+        if (mqtt.state()==-2 && (!lastProbe || millis()-lastProbe>=30000UL)) {
+          lastProbe=millis();
+          IPAddress brokerIP;
+          if (!WiFi.hostByName(MQTT_SERVER,brokerIP)) {
+            Serial.println("NET DIAG: DNS FAIL; chua phan giai duoc hostname broker.");
+          } else {
+            Serial.print("NET DIAG: DNS OK IP="); Serial.println(brokerIP);
+            WiFiClient probe;
+            errno=0;
+            bool tcpOK=probe.connect(brokerIP,MQTT_PORT,5000);
+            int socketError=errno;
+            Serial.printf("NET DIAG: TCP8883=%s errno=%d epoch=%lld heap=%lu\n",
+                          tcpOK?"OK":"FAIL",socketError,(long long)time(nullptr),(unsigned long)ESP.getFreeHeap());
+            probe.stop();
+            Serial.println(tcpOK?"TCP OK: can kiem tra TLS/CA/gio/loi handshake tren ESP32.":
+                                  "TCP FAIL: duong mang ESP32 chua mo duoc socket den broker; thu mang khac.");
+          }
+        }
       }
+      lastMqttTry=millis(); // Backoff starts after the attempt, not before a blocking handshake.
     }
     return mqtt.connected();
   }
@@ -447,32 +497,51 @@ bool makePayload(uint16_t batch, char* output, size_t capacity) {
 }
 
 bool uploadSession(uint32_t budgetStart, uint32_t budgetMs) {
+  xSemaphoreTake(mqttMutex,portMAX_DELAY);
   rawTopic = String("iot/") + session.deviceId + "/raw";
   ackTopic = String("iot/") + session.deviceId + "/ack";
   // A new file may have another device_id. Reconnect to guarantee the right subscription.
-  mqtt.disconnect();
+  mqtt.disconnect(); xSemaphoreGive(mqttMutex);
   for (uint16_t batch = 0; batch < SESSION_BATCHES; ++batch) {
     char payload[MQTT_BYTES];
     if (!makePayload(batch, payload, sizeof(payload))) { flashProblem = true; return false; }
+    xSemaphoreTake(mqttMutex,portMAX_DELAY);
     expectedAckBatch = batch + 1; ackReceived = packetWasSent = false;
+    xSemaphoreGive(mqttMutex);
     uint32_t lastSend = 0, batchWaitStart = millis(); bool attempted = false;
     while (!ackReceived && millis() - budgetStart < budgetMs &&
-           millis() - batchWaitStart < ACK_WAIT_MS) {
+           (!packetWasSent || millis() - batchWaitStart < ACK_WAIT_MS)) {
+      serialWearable();
+      reportMeasurementWait();
+      xSemaphoreTake(mqttMutex,portMAX_DELAY);
       if (networkReady(budgetStart, budgetMs) &&
           (!attempted || millis() - lastSend >= ACK_RETRY_MS)) {
         attempted = true; lastSend = millis();
-        if (mqtt.publish(rawTopic.c_str(), payload)) packetWasSent = true;
+        if (mqtt.publish(rawTopic.c_str(), payload)) {
+          if (!packetWasSent) {
+            batchWaitStart = millis();
+            Serial.printf("SENT batch=%u; cho collector luu MongoDB va tra ACK.\n", expectedAckBatch.load());
+          }
+          packetWasSent = true;
+        }
       }
+      publishAlert();
+      xSemaphoreGive(mqttMutex);
       delay(5);
     }
     if (!ackReceived) {
+      xSemaphoreTake(mqttMutex,portMAX_DELAY);
+      Serial.printf("UPLOAD STOP: WiFi=%d timeReady=%d MQTT=%d sent=%d; %s\n",
+                    int(WiFi.status()), time(nullptr) >= 1700000000, mqtt.connected(), packetWasSent.load(),
+                    packetWasSent ? "Kiem tra collector/MongoDB/ACK topic." : "Chua gui: kiem tra Wi-Fi/NTP/MQTT.");
       Serial.printf("UPLOAD PAUSED: batch=%u, elapsed=%lu ms; giu file flash.\n",
-                    expectedAckBatch, (unsigned long)(millis() - budgetStart));
+                    expectedAckBatch.load(), (unsigned long)(millis() - budgetStart));
+      xSemaphoreGive(mqttMutex);
       return false;
     }
-    Serial.printf("ACK %s %u/30 (%u cap)\n", session.sessionId, expectedAckBatch, PAIRS_PER_BATCH);
+    Serial.printf("ACK %s %u/30 (%u cap)\n", session.sessionId, expectedAckBatch.load(), PAIRS_PER_BATCH);
   }
-  expectedAckBatch = 0; packetWasSent = false;
+  xSemaphoreTake(mqttMutex,portMAX_DELAY); expectedAckBatch = 0; packetWasSent = false; xSemaphoreGive(mqttMutex);
   return true;
 }
 
@@ -495,72 +564,100 @@ bool flushPending(uint32_t budgetMs) {
   return listPending(remaining, MAX_SAVED_SESSIONS) == 0 && !flashProblem;
 }
 
-void setup() {
-  gpio_deep_sleep_hold_dis(); gpio_hold_dis(static_cast<gpio_num_t>(BUZZER_PIN));
-  buzzerWrite(false); pinMode(BUZZER_PIN, OUTPUT);
-  Serial.setTxBufferSize(1024); Serial.begin(9600);
-  delay(200);
-  if (xTaskCreate(buzzerTask, "buzzer", 2048, nullptr, 2, &buzzerHandle) != pdPASS) {
-    Serial.println("ERROR: buzzer task"); while (true) delay(1000);
-  }
-  Serial.println("BOOT: RAW_FLASH_ACK_V1");
-  Serial.println("TRANSPORT: MQTT_CLOUD_TLS_V1");
-  if (strcmp(CLOUD_HOST, "YOUR_MQTT_HOST") == 0 || !strlen(CLOUD_USER) ||
-      !strlen(CLOUD_PASSWORD) || !strstr(CLOUD_CA, "-----BEGIN CERTIFICATE-----"))
-    fatal("Chay configure_mqtt_cloud.py tren may tinh, sau do nap lai. Khong FORMAT.");
-  if (strcmp(WIFI_SSID, "TEN_WIFI") == 0 || strcmp(MQTT_SERVER, "IP_LAN_MAY_CHAY_MOSQUITTO") == 0 ||
-      !identifierValid(DEVICE_ID, sizeof(session.deviceId))) fatal("Dien Wi-Fi, IP MQTT va DEVICE_ID o dau file");
-  transport.setConnectionTimeout(5000);
-  transport.setHandshakeTimeout(8);
-  transport.setCACert(CLOUD_CA);
-  mqtt.setServer(MQTT_SERVER, MQTT_PORT); mqtt.setCallback(ackCallback);
-  mqtt.setSocketTimeout(2); mqtt.setKeepAlive(30);
-  if (!mqtt.setBufferSize(MQTT_BYTES + 128)) fatal("MQTT buffer");
-  mountStorage(); recoverTemporaryFiles();
-  // Replay old sessions even if the sensors are currently disconnected.
-  String pending[MAX_SAVED_SESSIONS];
-  if (flashProblem) fatal("Flash co file loi; giu du lieu, KHONG bat dau do moi.");
-  if (listPending(pending, MAX_SAVED_SESSIONS) > 0) {
-    Serial.println("REPLAY FIRST: gui het phien cu truoc khi do moi.");
-    sound.store(SoundMode::WAITING);
-    bool replayed = flushPending(REPLAY_BUDGET_MS);
-    if (!replayed || flashProblem) {
-      Serial.println("REPLAY PENDING: KHONG do moi. Giu flash, sleep; RESET de thu lai.");
-      sleepWithSignal(flashProblem ? SoundMode::ERROR : SoundMode::OFFLINE);
+void networkTask(void*) {
+  for (;;) {
+    if (xSemaphoreTake(mqttMutex,pdMS_TO_TICKS(20))==pdTRUE) {
+      networkReady(millis(),1000);
+      publishAlert();
+      xSemaphoreGive(mqttMutex);
     }
-    Serial.println("REPLAY DONE: da gui het phien cu. Bat dau do moi.");
-  } else {
-    Serial.println("NO PENDING: bat dau do ngay.");
-  }
-  sound.store(SoundMode::QUIET);
-  mqtt.disconnect(); WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
-  if (listPending(pending, MAX_SAVED_SESSIONS) >= MAX_SAVED_SESSIONS ||
-      LittleFS.totalBytes() - LittleFS.usedBytes() < sizeof(session) + 16384UL)
-    fatal("Flash gan day. Bat lai khi broker/collector online de gui phien cu; khong ghi de du lieu.");
-  if (!Wire.begin(SDA_PIN, SCL_PIN)) fatal("I2C begin");
-  Wire.setClock(100000); Wire.setTimeOut(10);
-  // Initialize MLX before enabling MAX sampling, avoiding startup FIFO overflow.
-  if (!mlx.begin(0x5A, &Wire)) fatal("Khong tim thay GY-906/MLX90614 tai 0x5A");
-  if (!maxSensor.begin(Wire, I2C_SPEED_STANDARD)) fatal("Khong tim thay MAX30102 tai 0x57");
-  maxReady = true;
-  maxSensor.setup(60, 4, 2, 400, 411, 4096);
-  maxSensor.shutDown(); maxSensor.disableFIFORollover(); maxSensor.clearFIFO();
-  uint8_t fifo = 0, spo2 = 0, mode = 0;
-  if (!readRegister(0x08, fifo) || !readRegister(0x0A, spo2) || !readRegister(0x09, mode) ||
-      (fifo & 0xE0) != 0x40 || (spo2 & 0x1F) != 0x0F || (mode & 0x07) != 0x03)
-    fatal("Cau hinh MAX doc lai khong khop 100Hz RED+IR");
-  acquireSession();
-  if (!commitSession()) fatal("Luu/kiem tra flash that bai; khong bao thanh cong");
-  Serial.println("FLASH SAVED. Co the gui lai sau RESET/mat nguon.");
-  sound.store(SoundMode::WAITING);
-  bool uploaded = flushPending(UPLOAD_BUDGET_MS);
-  if (uploaded && !flashProblem) {
-    Serial.println("SUCCESS: tat ca phien da du ACK.");
-    sleepWithSignal(SoundMode::SUCCESS);
-  } else {
-    Serial.println("OFFLINE/PENDING: du lieu van o flash; gui tiep o lan bat sau.");
-    sleepWithSignal(flashProblem ? SoundMode::ERROR : SoundMode::OFFLINE);
+    xSemaphoreTake(alertMutex,portMAX_DELAY);
+    eventSending=alertJournal.count>0;
+    xSemaphoreGive(alertMutex);
+    vTaskDelay(pdMS_TO_TICKS(20));
   }
 }
 
-void loop() { delay(1000); } // setup ends in deep sleep
+bool measurementRequested=true, measurementSensorsOK=false;
+uint32_t lastReplayAttempt=0;
+
+void setup() {
+  gpio_deep_sleep_hold_dis(); gpio_hold_dis(static_cast<gpio_num_t>(BUZZER_PIN));
+  buzzerWrite(false); pinMode(BUZZER_PIN,OUTPUT);
+  Serial.setTxBufferSize(2048); Serial.begin(9600); delay(200);
+  Serial.println("BOOT: WEARABLE_CONTINUOUS_V1");
+  Serial.println("TRANSPORT: MQTT_CLOUD_TLS_V1");
+  Wire.begin(SDA_PIN,SCL_PIN); Wire.setClock(100000); Wire.setTimeOut(10);
+  startWearable();
+  mqttMutex=xSemaphoreCreateMutex();
+  if (!mqttMutex) fatal("MQTT mutex");
+  if (strcmp(CLOUD_HOST,"YOUR_MQTT_HOST")==0 || !strlen(CLOUD_USER) || !strlen(CLOUD_PASSWORD) ||
+      !strstr(CLOUD_CA,"-----BEGIN CERTIFICATE-----") || !identifierValid(DEVICE_ID,32))
+    fatal("Cau hinh MqttCloud.h/DEVICE_ID; SOS va MPU van chay.");
+  transport.setConnectionTimeout(5000); transport.setHandshakeTimeout(8); transport.setCACert(CLOUD_CA);
+  mqtt.setServer(MQTT_SERVER,MQTT_PORT); mqtt.setCallback(ackCallback);
+  mqtt.setSocketTimeout(MQTT_RESPONSE_TIMEOUT_S); mqtt.setKeepAlive(30);
+  if (!mqtt.setBufferSize(MQTT_BYTES+128)) fatal("MQTT buffer");
+  if (xTaskCreatePinnedToCore(networkTask,"network",12288,nullptr,1,&networkHandle,0)!=pdPASS) fatal("network task");
+  mountStorage(); recoverTemporaryFiles();
+  xSemaphoreTake(sensorMutex,portMAX_DELAY);
+  bool tempOK=mlx.begin(0x5A,&Wire);
+  maxReady=maxSensor.begin(Wire,I2C_SPEED_STANDARD);
+  if (maxReady) {
+    maxSensor.setup(60,4,2,400,411,4096);
+    maxSensor.shutDown(); maxSensor.disableFIFORollover(); maxSensor.clearFIFO();
+    uint8_t fifo=0,spo2=0,mode=0;
+    measurementSensorsOK=tempOK && readRegister(0x08,fifo) && readRegister(0x0A,spo2) &&
+      readRegister(0x09,mode) && (fifo&0xE0)==0x40 && (spo2&0x1F)==0x0F && (mode&0x07)==0x03;
+  }
+  xSemaphoreGive(sensorMutex);
+  Serial.printf("MEASUREMENT INIT: MAX=%d MLX=%d config100Hz=%d\n",maxReady,tempOK,measurementSensorsOK);
+  if (!measurementSensorsOK) Serial.println("MEASUREMENT ERROR: kiem tra MAX30102/GY906; SOS/MPU van chay.");
+  Serial.println("READY: RESET yeu cau 1 luot do; sau do giam sat lien tuc, khong deep sleep.");
+}
+
+void reportMeasurementWait() {
+  static uint32_t last=0;
+  if (millis()-last<5000) return;
+  last=millis();
+  if (!measurementRequested) {
+    Serial.println("MEASUREMENT DONE: da thu 1 luot; tiep tuc giam sat. RESET de yeu cau luot moi."); return;
+  }
+  uint8_t phase=0,count=0;
+  xSemaphoreTake(alertMutex,portMAX_DELAY);
+  phase=alertJournal.phase; count=alertJournal.count;
+  xSemaphoreGive(alertMutex);
+  if (flashProblem || wearableFault.load()) Serial.printf("MEASUREMENT BLOCKED: rawFlashError=%d alertStorageError=%d; can sua luu tru, RESET khong xoa loi.\n",flashProblem,wearableFault.load());
+  else if (!measurementSensorsOK) Serial.println("MEASUREMENT BLOCKED: MAX30102/MLX90614 init/config loi; xem MEASUREMENT INIT.");
+  else if (!mpuHealthy.load()) Serial.println("MEASUREMENT BLOCKED: MPU chua san sang; xem MPU ERROR.");
+  else if (phase) Serial.printf("MEASUREMENT WAIT: alarm=%u; giu SOS 2 giay de huy/tat bao dong.\n",phase);
+  else if (count) Serial.printf("MEASUREMENT WAIT: con %u su kien cho ACK; bat collector va kiem tra MQTT.\n",count);
+  else Serial.println("MEASUREMENT REQUESTED: gui het raw backlog truoc, sau do thu MAX30102 + nhiet do.");
+}
+
+void loop() {
+  serialWearable();
+  reportMeasurementWait();
+  if (flashProblem || wearableFault.load()) { sound.store(SoundMode::QUIET); delay(10); return; }
+  String pending[MAX_SAVED_SESSIONS];
+  uint8_t count=listPending(pending,MAX_SAVED_SESSIONS);
+  if (count) {
+    if (!lastReplayAttempt || millis()-lastReplayAttempt>=30000UL) {
+      sound.store(SoundMode::WAITING);
+      Serial.println("REPLAY FIRST: gui phien cu; SOS/MPU van hoat dong.");
+      bool sent=flushPending(REPLAY_BUDGET_MS);
+      xSemaphoreTake(mqttMutex,portMAX_DELAY); expectedAckBatch=0; packetWasSent=false; xSemaphoreGive(mqttMutex);
+      sound.store(SoundMode::QUIET); lastReplayAttempt=millis();
+      Serial.println(sent?"REPLAY DONE":"REPLAY PENDING: giu flash, tu thu lai; khong do moi.");
+    }
+    delay(10); return;
+  }
+  if (measurementRequested && !pendingAlerts() && measurementSensorsOK && mpuHealthy.load()) {
+    if (LittleFS.totalBytes()-LittleFS.usedBytes()<sizeof(session)+16384UL) fatal("Flash gan day; khong ghi de.");
+    if (acquireSession()) {
+      if (!commitSession()) { flashProblem=true; Serial.println("ERROR: khong luu duoc phien; giu file de kiem tra."); }
+      else { measurementRequested=false; lastReplayAttempt=0; Serial.println("FLASH SAVED. Gui truoc khi do luot moi."); }
+    }
+  }
+  delay(10);
+}

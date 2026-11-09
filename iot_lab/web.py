@@ -11,6 +11,7 @@ from frames import frames
 from physiology import analyze, pulse_reference, oxygen_reference
 import demo
 import config
+from alerts import render_alert_panel
 
 st.set_page_config(page_title="Signal Lab",page_icon="〰",layout="wide",initial_sidebar_state="expanded")
 st.markdown("""<style>
@@ -83,12 +84,13 @@ status.caption("MINH HỌA" if mode=="Minh họa" else "MQTT → MONGODB")
 selected_device=None;selected_session=None
 if mode=="MongoDB":
     try:
+        render_alert_panel(st,db(),auto)
         devices=db().devices()
-        if not devices:st.info("Chưa có dữ liệu. Chạy collector và bật ESP32.");st.stop()
+        if not devices:st.info("Chưa nhận gói đo MAX30102/nhiệt độ. Log IMU trên Serial chưa phải phiên đo đã lưu; kiểm tra trạng thái đo trên ESP32 và collector.");st.stop()
         a,b=st.columns([1,3])
         selected_device=a.selectbox("Thiết bị",devices,label_visibility="collapsed")
         sessions=db().sessions(selected_device,hours)
-        if not sessions:st.info("Không có phiên trong khoảng đã chọn.");st.stop()
+        if not sessions:st.info(f"Không có phiên MAX30102/nhiệt độ trong {hours} giờ đã chọn. Tăng Khoảng dữ liệu lên 168 giờ để xem phiên cũ; lượt đo mới chỉ xuất hiện sau khi ESP32 thu và gửi dữ liệu.");st.stop()
         selected_session=b.selectbox("Phiên",[s["_id"] for s in sessions],label_visibility="collapsed")
     except PyMongoError:
         st.error("Chưa kết nối MongoDB. Kiểm tra dịch vụ MongoDB và file .env.");st.stop()

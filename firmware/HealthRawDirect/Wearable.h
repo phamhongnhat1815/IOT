@@ -287,7 +287,14 @@ void wearableTask(void*) {
       }
     } else previousTestStep=-1;
     writeIndicator(LED_RED_PIN,redOn,LED_RED_ON_LEVEL);
-    buzzerWrite(phase==2 && now%500<250);
+    static uint32_t reminderStarted = 0, previousReminderUntil = 0;
+    uint32_t until = reminderUntil.load();
+    if (until != previousReminderUntil) { previousReminderUntil = until; reminderStarted = now; }
+    uint32_t reminderPhase = (now - reminderStarted) % 2000UL;
+    bool reminderOn = until && int32_t(until - now) > 0 &&
+      (reminderPhase < 200UL || (reminderMissed.load() && reminderPhase >= 300UL && reminderPhase < 450UL));
+    // Emergency/grace owns the buzzer; reminders never mask an SOS/fall alarm.
+    buzzerWrite(phase ? (phase==2 && now%500<250) : reminderOn);
     writeIndicator(LED_BLUE_PIN,blueOn,LED_BLUE_ON_LEVEL);
     writeIndicator(LED_GREEN_PIN,greenOn,LED_GREEN_ON_LEVEL);
     static uint32_t lastLedLog=0;

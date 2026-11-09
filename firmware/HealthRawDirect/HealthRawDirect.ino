@@ -20,6 +20,8 @@
 #include <atomic>
 #include <math.h>
 #include <errno.h>
+#include <Preferences.h>
+#include "Reminder.h"
 
 SET_LOOP_TASK_STACK_SIZE(12288);
 
@@ -70,6 +72,12 @@ uint32_t lastTemperatureMs = 0, lastDrainUs = 0, lastSampleMs = 0;
 uint32_t contactSince = 0, lastLog = 0, attempts = 0, latestIR = 0;
 uint32_t lostEvents = 0;
 String rawTopic, ackTopic;
+String reminderTopic, reminderAckTopic;
+Preferences reminderPrefs;
+Reminder::Cache reminderCache;
+bool reminderStorageReady = false;
+// One 32-bit atomic snapshot; no 64-bit atomic dependency on ESP32.
+std::atomic<uint32_t> reminderSound{0};
 std::atomic<uint16_t> expectedAckBatch{0};
 std::atomic<bool> ackReceived{false}, packetWasSent{false};
 std::atomic<SoundMode> sound{SoundMode::QUIET};
@@ -342,7 +350,59 @@ bool acquireSession() {
   return true;
 }
 
+void initReminders() {
+  reminderTopic = String("iot/") + DEVICE_ID + "/control";
+  reminderAckTopic = String("iot/") + DEVICE_ID + "/control_ack";
+  if (!reminderPrefs.begin("slab-reminder", false)) {
+    Serial.println("REMINDER: NVS unavailable; reminders disabled, measurement unchanged."); return;
+  }
+  uint8_t snapshot[Reminder::SNAPSHOT_BYTES];
+  if (!reminderPrefs.isKey("cache")) {
+    Reminder::encode(reminderCache,snapshot);
+    reminderStorageReady = reminderPrefs.putBytes("cache",snapshot,sizeof(snapshot)) == sizeof(snapshot);
+  } else if (reminderPrefs.getBytesLength("cache") == sizeof(snapshot) &&
+             reminderPrefs.getBytes("cache",snapshot,sizeof(snapshot)) == sizeof(snapshot)) {
+    reminderStorageReady = Reminder::decode(snapshot,sizeof(snapshot),reminderCache);
+  }
+  Serial.println(reminderStorageReady ? "REMINDER: ready (sound only, no automatic measurement)." :
+                 "REMINDER: NVS invalid; preserved, no reminder ACK/sound. Do not erase NVS.");
+}
+
+void receiveReminder(byte* bytes,unsigned int length) {
+  if (!reminderStorageReady || length>512) return;
+  JsonDocument d;
+  if (deserializeJson(d,bytes,length) || !d.is<JsonObject>()) return;
+  if (strcmp(d["device_id"] | "",DEVICE_ID) || !d["expires_at"].is<uint64_t>()) return;
+  const char* id=d["event_id"] | "", *kind=d["event"] | "";
+  bool missed=!strcmp(kind,"measurement_missed");
+  if (!Reminder::Cache::validId(id) || (!missed && strcmp(kind,"measurement_due"))) return;
+  int64_t now=time(nullptr);
+  uint64_t expires=d["expires_at"].as<uint64_t>();
+  if (now<1700000000LL || expires<=uint64_t(now) || expires>4102444800ULL) return;
+  if (!reminderCache.contains(id)) {
+    Reminder::Cache candidate=reminderCache;
+    if (!candidate.add(id,expires,uint64_t(now))) {
+      Serial.println("REMINDER: unexpired ID cache full; wait for retry."); return;
+    }
+    uint8_t snapshot[Reminder::SNAPSHOT_BYTES];
+    Reminder::encode(candidate,snapshot);
+    if (reminderPrefs.putBytes("cache",snapshot,sizeof(snapshot)) != sizeof(snapshot)) {
+      // A failed/uncertain write must not produce an application ACK or sound.
+      reminderStorageReady=false;
+      Serial.println("REMINDER: persistence failed; disabled until restart."); return;
+    }
+    reminderCache=candidate;
+    reminderSound.store(Reminder::soundWord(millis(),missed));
+    Serial.println(missed ? "REMINDER: missed measurement (sound only)." : "REMINDER: measurement due (sound only).");
+  }
+  JsonDocument ack;
+  ack["device_id"]=DEVICE_ID; ack["event_id"]=id; ack["received"]=true;
+  char payload[192]; serializeJson(ack,payload,sizeof(payload));
+  mqtt.publish(reminderAckTopic.c_str(),payload,false);
+}
+
 void ackCallback(char* topic, byte* bytes, unsigned int length) {
+  if (reminderTopic == topic) { receiveReminder(bytes,length); return; }
   String own=String("iot/")+DEVICE_ID;
   if (length<=768 && (String(topic)==own+"/event_ack" || String(topic)==own+"/command")) {
     JsonDocument d;
@@ -428,6 +488,7 @@ bool networkReady(uint32_t budgetStart, uint32_t budgetMs) {
         String own=String("iot/")+DEVICE_ID;
         ok=mqtt.subscribe((own+"/event_ack").c_str(),1) && ok;
         ok=mqtt.subscribe((own+"/command").c_str(),1) && ok;
+        ok=mqtt.subscribe(reminderTopic.c_str(),1) && ok;
         if (!ok) mqtt.disconnect();
         Serial.printf("MQTT connected=%d\n", mqtt.connected());
       } else {
@@ -595,6 +656,7 @@ void setup() {
       !strstr(CLOUD_CA,"-----BEGIN CERTIFICATE-----") || !identifierValid(DEVICE_ID,32))
     fatal("Cau hinh MqttCloud.h/DEVICE_ID; SOS va MPU van chay.");
   transport.setConnectionTimeout(5000); transport.setHandshakeTimeout(8); transport.setCACert(CLOUD_CA);
+  initReminders();
   mqtt.setServer(MQTT_SERVER,MQTT_PORT); mqtt.setCallback(ackCallback);
   mqtt.setSocketTimeout(MQTT_RESPONSE_TIMEOUT_S); mqtt.setKeepAlive(30);
   if (!mqtt.setBufferSize(MQTT_BYTES+128)) fatal("MQTT buffer");

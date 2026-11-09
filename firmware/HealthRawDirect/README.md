@@ -124,3 +124,9 @@ If NTP is blocked, obtain fresh Unix seconds from a trusted Mac using `date +%s`
 ### MQTT response timing
 
 CONNACK/socket response timeout is 15 seconds (formerly 2); reconnect backoff is 10 seconds after the attempt ends. The secure client yields when no bytes are available, retaining the independent SOS/IMU task. Positive NetworkClientSecure::lastError values can be successful socket descriptors in Arduino-ESP32 3.3.12, so only negative values are labeled TLS errors. `EVENT SENT` is not durable confirmation; `EVENT ACK` reports the remaining journal count after persistence of the ACK removal succeeds.
+
+## MQTT measurement reminder extension
+
+Keep Reminder.h beside the sketch. This addition receives iot/<device>/control and replies on iot/<device>/control_ack. Update broker ACLs and flash this firmware to enable reminder sound. The original main firmware does not understand these topics. Existing measurement startup, button actions, sensors, alarm logic and raw upload remain unchanged. A reminder NEVER starts a measurement.
+
+Reminder IDs/expiry are persisted in a separate NVS namespace before acknowledgement/sound. Due and missed sounds run for 10 seconds in the existing output task; alarm and fall grace have priority. ACK means accepted, not that a person heard the sound. See ../../docs/LICH_DO_VA_THONG_BAO.md for limits and real-board checks. Native policy tests pass; full ESP32 compilation and hardware behavior are not yet verified on this machine (ESP32 core absent).

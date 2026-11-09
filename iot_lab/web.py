@@ -270,7 +270,8 @@ def schedule_panel():
         monitor = get_monitor()
         rows = list(monitor.db.schedules.find().sort("created_at", -1))
         st.markdown(badge(f"{sum(r['enabled'] for r in rows)} lịch đang bật", "blue") + " " + badge(f"{len(rows)} lịch đã tạo"), unsafe_allow_html=True)
-        st.caption("Lịch chạy trong collector, kể cả khi đóng web. ESP32 phải được nạp firmware chờ online và có kết nối MQTT.")
+        st.caption("Lịch chạy trong collector, kể cả khi đóng web. Nhắc đo, bỏ lịch và cảnh báo được lưu vào MongoDB.")
+        st.info("Để ESP32 phát còi nhắc, cần nạp firmware có Reminder.h và cấp quyền MQTT control/control_ack. Lời nhắc chỉ phát còi, không tự bắt đầu đo; cách đo của thiết bị giữ nguyên.")
         selected = st.selectbox("Chỉnh sửa lịch", [None] + [r["_id"] for r in rows],
             key="schedule_selection", format_func=lambda x: "Thêm lịch mới" if x is None else next(f"{r['device_id']} · {r['hour']}" for r in rows if r["_id"] == x))
         current = next((r for r in rows if r["_id"] == selected), {})
@@ -355,7 +356,7 @@ def notifications_panel():
                 "Hạn đo": local_time(r["deadline"]), "Trạng thái": STATE_LABELS.get(r["status"], r["status"])} for r in occurrences]), hide_index=True, width="stretch")
         else:
             st.caption("Chưa đến giờ hẹn nào.")
-        st.caption("ACK của ESP32 xác nhận đã nhận lệnh nhắc, không xác nhận người dùng đã đo. Nhắc hết hạn sẽ không gửi tiếp.")
+        st.caption("Cần firmware nhắc đo mới để nhận control/control_ack. Broker đã nhận không có nghĩa ESP32 đã nhận. ESP32 xác nhận là đã chấp nhận lời nhắc, không xác nhận người dùng đã nghe còi hoặc đã đo. Nhắc hết hạn sẽ không gửi tiếp.")
     except (PyMongoError, ValueError):
         st.error("Không đọc được thông báo từ MongoDB.")
 
